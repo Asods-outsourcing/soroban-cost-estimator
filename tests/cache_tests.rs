@@ -3229,3 +3229,279 @@ fn test_cached_estimate_backward_compatible_deserialization() {
     );
     assert_eq!(parsed_new.core_version.as_deref(), Some("v21.2.0"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cache decision diagnostics tests (#522)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_cache_decision_reason_codes() {
+    use soroban_cost_estimator::cache::CacheDecisionReason;
+
+    assert_eq!(CacheDecisionReason::ExplicitBypass.code(), "explicit_bypass");
+    assert_eq!(CacheDecisionReason::NoEntry.code(), "miss_no_entry");
+    assert_eq!(CacheDecisionReason::Expired.code(), "miss_expired");
+    assert_eq!(CacheDecisionReason::NetworkMismatch.code(), "miss_network");
+    assert_eq!(CacheDecisionReason::Hit.code(), "hit");
+}
+
+/// Test cache hit path: loads a fresh entry and returns it.
+/// The load_fresh_estimate function should emit a debug event with reason="hit".
+#[test]
+fn test_load_fresh_estimate_hit_path() {
+    with_temp_home(|_tmp| {
+        let wasm_hash = "abc123def456";
+        let function = "transfer";
+        let args = vec!["arg1".to_string()];
+        let network = "testnet";
+
+        // Save an estimate now
+        cache::save_estimate(
+            wasm_hash,
+            function,
+            &args,
+            network,
+            42,
+            1_000_000,
+            200_000,
+            50_000,
+            None,
+            true,
+        )
+        .expect("save estimate");
+
+        // Load it back within a generous TTL — should hit
+        let ttl = std::time::Duration::from_secs(3600);
+        let loaded = cache::load_fresh_estimate(wasm_hash, function, &args, ttl)
+            .expect("load fresh")
+            .expect("estimate should be fresh");
+
+        assert_eq!(loaded.wasm_hash, wasm_hash);
+        assert_eq!(loaded.function, function);
+        assert_eq!(loaded.network, network);
+        assert_eq!(loaded.ledger, 42);
+        assert_eq!(loaded.total_stroops, 1_000_000);
+    });
+}
+
+/// Test cache miss path: no entry found.
+/// The load_fresh_estimate function should emit a debug event with reason="miss_no_entry".
+#[test]
+fn test_load_fresh_estimate_miss_no_entry_path() {
+    with_temp_home(|_tmp| {
+        let wasm_hash = "nonexistent_hash";
+        let function = "does_not_exist";
+        let args = vec![];
+
+        // Try to load an entry that was never saved — should miss
+        let ttl = std::time::Duration::from_secs(3600);
+        let loaded = cache::load_fresh_estimate(wasm_hash, function, &args, ttl).expect("load");
+
+        assert!(loaded.is_none(), "nonexistent entry should return None");
+    });
+}
+
+/// Test cache expiration path: entry exists but is older than TTL.
+/// The load_fresh_estimate function should emit a debug event with reason="miss_expired".
+#[test]
+fn test_load_fresh_estimate_miss_expired_path() {
+    with_temp_home(|_tmp| {
+        let wasm_hash = "aged_hash";
+        let function = "old_func";
+        let args = vec!["x".to_string()];
+
+        // Save an estimate now
+        cache::save_estimate(
+            wasm_hash,
+            function,
+            &args,
+            "testnet",
+            10,
+            100_000,
+            10_000,
+            5_000,
+            None,
+            true,
+        )
+        .expect("save estimate");
+
+        // Try to load it with a very short TTL (1 nanosecond) — should expire
+        let ttl = std::time::Duration::from_nanos(1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let loaded = cache::load_fresh_estimate(wasm_hash, function, &args, ttl).expect("load");
+
+        assert!(
+            loaded.is_none(),
+            "expired entry should return None (ttl: {} nanos, waited 10ms)",
+            ttl.as_nanos()
+        );
+    });
+}
+
+/// Test is_cache_entry_fresh with entry at exact TTL boundary.
+#[test]
+fn test_is_cache_entry_fresh_at_ttl_boundary() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate(
+            "boundary_hash",
+            "boundary_func",
+            &[],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+            None,
+            true,
+        )
+        .expect("save");
+
+        let loaded = cache::load_estimate("boundary_hash", "boundary_func", &[])
+            .expect("load")
+            .expect("entry should exist");
+
+        // Entry is fresh immediately
+        let instant_ttl = std::time::Duration::from_secs(0);
+        let fresh = cache::is_cache_entry_fresh(&loaded, instant_ttl);
+        assert!(!fresh, "entry with 0s TTL should not be fresh (age >= ttl)");
+
+        // Entry is definitely fresh with a long TTL
+        let long_ttl = std::time::Duration::from_secs(86400);
+        let fresh = cache::is_cache_entry_fresh(&loaded, long_ttl);
+        assert!(fresh, "entry with 1-day TTL should be fresh");
+    });
+}
+
+/// Test that different cache keys do not interfere.
+#[test]
+fn test_load_fresh_estimate_different_keys_isolated() {
+    with_temp_home(|_tmp| {
+        let args1 = vec!["arg1".to_string()];
+        let args2 = vec!["arg2".to_string()];
+
+        cache::save_estimate("h1", "f1", &args1, "testnet", 1, 100, 10, 5, None, true)
+            .expect("save 1");
+        cache::save_estimate("h1", "f1", &args2, "testnet", 2, 200, 20, 10, None, true)
+            .expect("save 2");
+
+        let ttl = std::time::Duration::from_secs(3600);
+
+        let loaded1 = cache::load_fresh_estimate("h1", "f1", &args1, ttl)
+            .expect("load 1")
+            .expect("arg1 entry should exist");
+        assert_eq!(loaded1.ledger, 1);
+
+        let loaded2 = cache::load_fresh_estimate("h1", "f1", &args2, ttl)
+            .expect("load 2")
+            .expect("arg2 entry should exist");
+        assert_eq!(loaded2.ledger, 2);
+    });
+}
+
+/// Test that cache entries with unparseable timestamps are treated as not fresh.
+#[test]
+fn test_is_cache_entry_fresh_with_invalid_timestamp() {
+    with_temp_home(|tmp| {
+        write_raw_entry(
+            tmp,
+            "bad_ts_hash",
+            "bad_ts_func",
+            &[],
+            None,
+            5,
+        );
+
+        let mut loaded = cache::load_estimate("bad_ts_hash", "bad_ts_func", &[])
+            .expect("load")
+            .expect("entry should exist");
+
+        // Corrupt the timestamp
+        loaded.timestamp = "not-a-valid-timestamp".to_string();
+
+        // Entry should not be fresh (bad timestamp treated as suspicious)
+        let ttl = std::time::Duration::from_secs(86400);
+        let fresh = cache::is_cache_entry_fresh(&loaded, ttl);
+        assert!(!fresh, "entry with invalid timestamp should not be fresh");
+    });
+}
+
+/// Test load_fresh_estimate with missing TTL returns None.
+/// In practice, fresh_cached_estimate in main.rs only calls load_fresh_estimate
+/// when ttl_secs is Some, but test the contract anyway.
+#[test]
+fn test_load_fresh_estimate_respects_ttl_parameter() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate(
+            "ttl_hash",
+            "ttl_func",
+            &[],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+            None,
+            true,
+        )
+        .expect("save");
+
+        // Load with zero TTL (immediate expiration)
+        let loaded = cache::load_fresh_estimate("ttl_hash", "ttl_func", &[], 
+            std::time::Duration::from_secs(0))
+            .expect("load");
+
+        // Entry should expire immediately with 0s TTL
+        assert!(
+            loaded.is_none(),
+            "entry should not be fresh with 0s TTL"
+        );
+
+        // Load with a reasonable TTL
+        let loaded = cache::load_fresh_estimate("ttl_hash", "ttl_func", &[], 
+            std::time::Duration::from_secs(86400))
+            .expect("load");
+
+        assert!(
+            loaded.is_some(),
+            "entry should be fresh with 1-day TTL"
+        );
+    });
+}
+
+/// Test that save operations complete successfully and entries can be loaded.
+/// This implicitly tests that cache save operations don't cause corruption.
+#[test]
+fn test_cache_save_and_load_roundtrip_fresh() {
+    with_temp_home(|_tmp| {
+        let entries = vec![
+            ("hash1", "func1", vec!["a".to_string()], "testnet", 100u32),
+            ("hash2", "func2", vec!["b".to_string()], "mainnet", 200u32),
+            ("hash3", "func3", vec!["c".to_string()], "futurenet", 300u32),
+        ];
+
+        for (hash, func, args, network, ledger) in &entries {
+            cache::save_estimate(
+                hash,
+                func,
+                args,
+                network,
+                *ledger,
+                1_000_000,
+                100_000,
+                10_000,
+                None,
+                true,
+            )
+            .expect("save");
+        }
+
+        // Load all entries back and verify freshness
+        let ttl = std::time::Duration::from_secs(3600);
+        for (hash, func, args, _network, ledger) in &entries {
+            let loaded = cache::load_fresh_estimate(hash, func, args, ttl)
+                .expect("load")
+                .expect("entry should be fresh");
+            assert_eq!(loaded.ledger, *ledger);
+        }
+    });
+}

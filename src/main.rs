@@ -1436,6 +1436,7 @@ async fn cmd_estimate_repeat(
 
         let ttl_secs = cache_ttl.map(parse_interval_secs);
         let fresh = if no_cache {
+            emit_cache_bypass_event(&wasm_hash, function_name);
             None
         } else {
             fresh_cached_estimate(&wasm_hash, function_name, args, ttl_secs)?
@@ -1829,6 +1830,7 @@ async fn estimate_once(
         let ttl_secs = cache_ttl.map(parse_interval_secs);
         let fresh = if no_cache {
             // Bypass every cache read, even under `--cache-ttl`.
+            emit_cache_bypass_event(&wasm_hash, function_name);
             None
         } else {
             fresh_cached_estimate(&wasm_hash, &function_name, args, ttl_secs)?
@@ -1968,6 +1970,18 @@ async fn estimate_once(
                 report.memory_bytes,
                 Some(report.rpc_latency_ms),
                 true,
+            );
+            let wasm_short = if wasm_hash.len() > 8 {
+                &wasm_hash[..8]
+            } else {
+                &wasm_hash
+            };
+            debug!(
+                function = function_name,
+                wasm_hash = wasm_short,
+                reason = "save",
+                ledger = report.ledger,
+                "cache decision"
             );
         }
         info!(
@@ -4368,6 +4382,22 @@ fn fresh_cached_estimate(
         args,
         std::time::Duration::from_secs(ttl_secs),
     )
+}
+
+/// Emit a debug event for explicit cache bypass.
+fn emit_cache_bypass_event(wasm_hash: &str, function: &str) {
+    use tracing::debug;
+    let wasm_short = if wasm_hash.len() > 8 {
+        &wasm_hash[..8]
+    } else {
+        wasm_hash
+    };
+    debug!(
+        function,
+        wasm_hash = wasm_short,
+        reason = "explicit_bypass",
+        "cache decision"
+    );
 }
 
 /// Print a fresh cached estimate that `estimate` is reusing instead of

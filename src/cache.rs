@@ -42,6 +42,37 @@ use tracing::warn;
 use crate::error::AppError;
 use crate::error::AppResult;
 
+/// Reason why a cache entry was accepted or rejected.
+///
+/// Used for structured debug logging to help operators understand
+/// cache behavior without exposing internal details or credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheDecisionReason {
+    /// Cache read was bypassed by `--no-cache` flag.
+    ExplicitBypass,
+    /// No entry found for this key.
+    NoEntry,
+    /// Entry found but expired (older than requested TTL).
+    Expired,
+    /// Entry found but network mismatch (caller requested different network).
+    NetworkMismatch,
+    /// Entry found and is fresh.
+    Hit,
+}
+
+impl CacheDecisionReason {
+    /// Return a safe, short reason code suitable for structured logging.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::ExplicitBypass => "explicit_bypass",
+            Self::NoEntry => "miss_no_entry",
+            Self::Expired => "miss_expired",
+            Self::NetworkMismatch => "miss_network",
+            Self::Hit => "hit",
+        }
+    }
+}
+
 /// Check whether a rusqlite error is `SQLITE_BUSY`.
 fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
     err.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
@@ -1490,6 +1521,8 @@ pub fn load_estimate(
 /// Whether a cached estimate is still fresh, i.e. its timestamp is within
 /// `ttl` of now.
 ///
+/// Emits a debug event with the cache decision reason (Hit, Expired, or NoEntry).
+///
 /// Entries whose timestamp cannot be parsed as RFC 3339 are treated as **not**
 /// fresh: an unverifiable age must not be trusted, so the caller re-simulates
 /// and overwrites the entry.
@@ -1507,10 +1540,16 @@ pub fn is_cache_entry_fresh(entry: &CachedEstimate, ttl: std::time::Duration) ->
     chrono::Utc::now().signed_duration_since(ts) <= ttl
 }
 
-/// Load a cached estimate only if it is still fresh (within `ttl`).
+/// Load a cached estimate only if it is still fresh (within `ttl`),
+/// and emit a debug event indicating the cache decision and reason.
 ///
 /// Returns `Ok(None)` when no entry exists **or** when the entry has
 /// expired — both mean "re-simulate".
+///
+/// Emits a debug event at each decision point:
+/// - `Hit`: Entry found and fresh
+/// - `Expired`: Entry found but older than TTL
+/// - `NoEntry`: No entry found for this cache key
 ///
 /// # Network calls
 /// None — pure SQLite I/O.
@@ -1521,17 +1560,56 @@ pub fn load_fresh_estimate(
     ttl: std::time::Duration,
 ) -> AppResult<Option<CachedEstimate>> {
     let Some(cached) = load_estimate(wasm_hash, function, args)? else {
+        let wasm_short = if wasm_hash.len() > 8 {
+            &wasm_hash[..8]
+        } else {
+            wasm_hash
+        };
+        debug!(
+            function,
+            wasm_hash = wasm_short,
+            reason = CacheDecisionReason::NoEntry.code(),
+            "cache decision"
+        );
         return Ok(None);
     };
     if is_cache_entry_fresh(&cached, ttl) {
-        trace!(function, ttl_secs = ttl.as_secs(), "fresh cached estimate");
+        let wasm_short = if wasm_hash.len() > 8 {
+            &wasm_hash[..8]
+        } else {
+            wasm_hash
+        };
+        let age_secs = chrono::Utc::now()
+            .signed_duration_since(
+                chrono::DateTime::parse_from_rfc3339(&cached.timestamp)
+                    .ok()
+                    .map(|ts| ts.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(chrono::Utc::now),
+            )
+            .num_seconds() as u64;
+        debug!(
+            function,
+            wasm_hash = wasm_short,
+            reason = CacheDecisionReason::Hit.code(),
+            age_secs,
+            ttl_secs = ttl.as_secs(),
+            ledger = cached.ledger,
+            "cache decision"
+        );
         Ok(Some(cached))
     } else {
-        trace!(
+        let wasm_short = if wasm_hash.len() > 8 {
+            &wasm_hash[..8]
+        } else {
+            wasm_hash
+        };
+        debug!(
             function,
+            wasm_hash = wasm_short,
+            reason = CacheDecisionReason::Expired.code(),
             ttl_secs = ttl.as_secs(),
             timestamp = %cached.timestamp,
-            "cached estimate expired"
+            "cache decision"
         );
         Ok(None)
     }
