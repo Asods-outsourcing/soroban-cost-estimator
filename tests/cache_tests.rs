@@ -3229,3 +3229,324 @@ fn test_cached_estimate_backward_compatible_deserialization() {
     );
     assert_eq!(parsed_new.core_version.as_deref(), Some("v21.2.0"));
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Backup and Restore (#520)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Backup while other threads are actively writing produces a consistent
+/// snapshot that can be fully restored and verified.
+#[test]
+fn test_backup_during_concurrent_writes() {
+    with_temp_home(|tmp| {
+        // Seed the cache with some initial data
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("seed f1");
+        cache::save_estimate("h2", "f2", &[], "testnet", 2, 200, 20, 10, None, true)
+            .expect("seed f2");
+
+        // Spawn multiple threads writing concurrently
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for j in 0..10 {
+                        let hash = format!("hash-{t}-{j}");
+                        let func = format!("func-{t}-{j}");
+                        cache::save_estimate(
+                            &hash,
+                            &func,
+                            &[],
+                            "testnet",
+                            (t * 10 + j) as u32,
+                            1_000 + j as i64,
+                            100 + j as u64,
+                            50 + j as u64,
+                            None,
+                            true,
+                        )
+                        .expect("concurrent save");
+                    }
+                })
+            })
+            .collect();
+
+        // Backup while writes are happening
+        let backup_dir = tmp.join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+        let backup_path = backup_dir
+            .join("concurrent-backup.db")
+            .to_string_lossy()
+            .to_string();
+
+        let backup = cache::backup_database(Some(&backup_path));
+
+        // Let the threads finish
+        for handle in handles {
+            handle.join().expect("thread panicked");
+        }
+
+        // Backup should have succeeded
+        assert!(
+            backup.is_ok(),
+            "backup during concurrent writes should succeed"
+        );
+        assert!(
+            std::path::Path::new(&backup_path).exists(),
+            "backup file should exist"
+        );
+
+        // Verify the backup is readable and not corrupted
+        let count = cache::count_estimates_in_backup(&backup_path).expect("count in backup");
+        assert!(
+            count > 0,
+            "backup should contain estimates, got count: {count}"
+        );
+
+        // Verify all estimates in the live cache are valid
+        let statuses = cache::verify_cache().expect("verify live cache");
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "all live cache entries must be valid after concurrent writes"
+        );
+    });
+}
+
+/// Restore into a fresh (empty) cache location works correctly and all
+/// entries are recoverable with proper schema versions.
+#[test]
+fn test_restore_into_empty_location() {
+    with_temp_home(|tmp| {
+        // Create cache entries with various properties
+        cache::save_estimate(
+            "h1",
+            "f1",
+            &["arg1".to_string()],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+            None,
+            true,
+        )
+        .expect("save f1");
+        cache::save_estimate("h2", "f2", &[], "mainnet", 2, 200, 20, 10, None, true)
+            .expect("save f2");
+        cache::save_estimate(
+            "h3",
+            "f3",
+            &["x".to_string(), "y".to_string()],
+            "testnet",
+            3,
+            300,
+            30,
+            15,
+            None,
+            true,
+        )
+        .expect("save f3");
+
+        // Create a backup
+        let backup_dir = tmp.join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+        let backup_path = backup_dir
+            .join("restore-test.db")
+            .to_string_lossy()
+            .to_string();
+        cache::backup_database(Some(&backup_path)).expect("backup");
+
+        // Count entries in backup
+        let backup_count = cache::count_estimates_in_backup(&backup_path).expect("count backup");
+        assert_eq!(backup_count, 3, "backup should have 3 entries");
+
+        // Clear the live cache by moving it out of the way
+        let db_path = soroban_cost_estimator::paths::data_dir()
+            .expect("data dir")
+            .join("cache.db");
+        let moved_path = tmp.join("original-cache.db");
+        if db_path.exists() {
+            std::fs::rename(&db_path, &moved_path).expect("move original cache");
+        }
+
+        // Restore from backup
+        cache::restore_database(&backup_path).expect("restore");
+
+        // Verify all entries are present in the restored cache
+        let restored_f1 = cache::load_estimate("h1", "f1", &["arg1".to_string()])
+            .expect("load f1")
+            .expect("f1 should be restored");
+        assert_eq!(restored_f1.total_stroops, 100);
+        assert_eq!(restored_f1.version, cache::CACHE_SCHEMA_VERSION);
+
+        let restored_f2 = cache::load_estimate("h2", "f2", &[])
+            .expect("load f2")
+            .expect("f2 should be restored");
+        assert_eq!(restored_f2.network, "mainnet");
+        assert_eq!(restored_f2.total_stroops, 200);
+
+        let restored_f3 = cache::load_estimate("h3", "f3", &["x".to_string(), "y".to_string()])
+            .expect("load f3")
+            .expect("f3 should be restored");
+        assert_eq!(restored_f3.ledger, 3);
+        assert_eq!(restored_f3.cpu_instructions, 30);
+
+        // All entries must be valid
+        let statuses = cache::verify_cache().expect("verify restored cache");
+        assert_eq!(statuses.len(), 3, "restored cache should have 3 entries");
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "all restored entries must be valid"
+        );
+
+        // Stats should match
+        let stats = cache::cache_stats().expect("stats");
+        assert_eq!(stats.total_entries, 3, "restored cache must have 3 entries");
+        assert_eq!(
+            stats.per_network.len(),
+            2,
+            "restored cache must have 2 networks"
+        );
+    });
+}
+
+/// Restore rejects a backup with an incompatible (future) schema version
+/// and leaves the original database untouched.
+#[test]
+fn test_restore_rejects_incompatible_backup() {
+    with_temp_home(|tmp| {
+        // Create and backup the current cache
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("save initial");
+
+        let backup_dir = tmp.join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+        let backup_path = backup_dir
+            .join("incompatible.db")
+            .to_string_lossy()
+            .to_string();
+        cache::backup_database(Some(&backup_path)).expect("backup");
+
+        // Corrupt the backup by inserting a future-version entry
+        let backup_conn = rusqlite::Connection::open(&backup_path).expect("open backup");
+        backup_conn
+            .execute(
+                "INSERT INTO estimates (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+                 VALUES (?, 'future', 'future_func', 'abc123', 'testnet', 1, 100, 10, 5, '2026-01-01T00:00:00Z')",
+                [cache::CACHE_SCHEMA_VERSION + 5],
+            )
+            .expect("insert future-version entry");
+        drop(backup_conn);
+
+        // Try to restore the incompatible backup
+        let restore_result = cache::restore_database(&backup_path);
+        assert!(
+            restore_result.is_err(),
+            "restore should reject incompatible backup"
+        );
+
+        let err_msg = restore_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("newer"),
+            "error should mention the newer version: {err_msg}"
+        );
+
+        // Verify the original cache is still intact
+        let original = cache::load_estimate("h1", "f1", &[])
+            .expect("load original")
+            .expect("original entry should still exist");
+        assert_eq!(original.total_stroops, 100);
+        assert_eq!(original.version, cache::CACHE_SCHEMA_VERSION);
+    });
+}
+
+/// Backup stats helper returns accurate information about a backup file.
+#[test]
+fn test_backup_stats_reports_accurate_info() {
+    with_temp_home(|tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("save testnet");
+        cache::save_estimate("h2", "f2", &[], "mainnet", 2, 200, 20, 10, None, true)
+            .expect("save mainnet");
+
+        let backup_dir = tmp.join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+        let backup_path = backup_dir
+            .join("stats-test.db")
+            .to_string_lossy()
+            .to_string();
+        cache::backup_database(Some(&backup_path)).expect("backup");
+
+        let stats = cache::backup_stats(&backup_path).expect("stats");
+        assert_eq!(stats.total_entries, 2, "backup should report 2 entries");
+        assert!(stats.disk_bytes > 0, "backup should report non-zero size");
+        assert_eq!(
+            stats.per_network.len(),
+            2,
+            "backup should list both networks"
+        );
+
+        let testnet_count = stats
+            .per_network
+            .iter()
+            .find(|(n, _)| n == "testnet")
+            .map(|(_, c)| c);
+        assert_eq!(testnet_count, Some(&1), "testnet should have 1 entry");
+
+        let mainnet_count = stats
+            .per_network
+            .iter()
+            .find(|(n, _)| n == "mainnet")
+            .map(|(_, c)| c);
+        assert_eq!(mainnet_count, Some(&1), "mainnet should have 1 entry");
+    });
+}
+
+/// Backup database creates a file with a default timestamp-based name
+/// when no explicit path is given.
+#[test]
+fn test_backup_creates_default_filename() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
+
+        let backup_path = cache::backup_database(None).expect("backup");
+        assert!(
+            std::path::Path::new(&backup_path).exists(),
+            "default backup file should exist: {backup_path}"
+        );
+        assert!(
+            backup_path.contains("cache-"),
+            "backup filename should contain 'cache-': {backup_path}"
+        );
+        assert!(
+            backup_path.ends_with(".db"),
+            "backup filename should end with '.db': {backup_path}"
+        );
+    });
+}
+
+/// Validate backup schema rejects empty backups (no estimates table).
+#[test]
+fn test_validate_backup_schema_rejects_empty_backup() {
+    with_temp_home(|tmp| {
+        let backup_dir = tmp.join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+        let empty_backup = backup_dir.join("empty.db").to_string_lossy().to_string();
+
+        // Create an empty SQLite database with no estimates table
+        let _conn = rusqlite::Connection::open(&empty_backup)
+            .expect("create empty db")
+            .close();
+
+        let result = cache::validate_backup_schema(&empty_backup);
+        assert!(
+            result.is_err(),
+            "validation should reject empty backup with no estimates table"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no cache entries"),
+            "error should mention no cache entries: {err_msg}"
+        );
+    });
+}
