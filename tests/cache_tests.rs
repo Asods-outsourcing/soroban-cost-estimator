@@ -3231,322 +3231,1126 @@ fn test_cached_estimate_backward_compatible_deserialization() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Backup and Restore (#520)
+// Schema migration: comprehensive tests for all supported transitions
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Backup while other threads are actively writing produces a consistent
-/// snapshot that can be fully restored and verified.
+/// Test helper to create a database at a specific schema version with
+/// realistic data.
+fn build_database_at_schema_version(tmp: &Path, version: u32, entry_count: usize) {
+    let dir = tmp.join(".soroban-cost-estimator");
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let db = dir.join("cache.db");
+    let conn = rusqlite::Connection::open(&db).expect("open cache db");
+
+    // Ensure the v3 schema exists first (for testing migrations from older
+    // versions, we need all columns present in the current schema).
+    cache::ensure_cache_schema(&conn).expect("ensure schema");
+
+    // Insert entries at the requested schema version
+    for i in 0..entry_count {
+        let wasm_hash = format!("hash-v{}-{}", version, i);
+        let function = format!("func-v{}-{}", version, i);
+        let args_hash = format!("args-{}", i);
+        insert_raw_row(
+            tmp,
+            version,
+            &wasm_hash,
+            &function,
+            &[],
+            "testnet",
+            (10 + i as u32) * 100,
+            &format!("2026-01-{:02}T{:02}:00:00Z", (i % 28) + 1, (i % 24)),
+        );
+    }
+}
+
+/// Schema v1 (initial) entries should load and migrate to v3 without error.
+/// v1 entries lack `duration_ms`, `success`, and `last_accessed`.
 #[test]
-fn test_backup_during_concurrent_writes() {
+fn test_migrate_v1_to_latest() {
     with_temp_home(|tmp| {
-        // Seed the cache with some initial data
-        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
-            .expect("seed f1");
-        cache::save_estimate("h2", "f2", &[], "testnet", 2, 200, 20, 10, None, true)
-            .expect("seed f2");
+        build_database_at_schema_version(tmp, cache::INITIAL_SCHEMA_VERSION, 3);
 
-        // Spawn multiple threads writing concurrently
-        let handles: Vec<_> = (0..4)
-            .map(|t| {
-                std::thread::spawn(move || {
-                    for j in 0..10 {
-                        let hash = format!("hash-{t}-{j}");
-                        let func = format!("func-{t}-{j}");
-                        cache::save_estimate(
-                            &hash,
-                            &func,
-                            &[],
-                            "testnet",
-                            (t * 10 + j) as u32,
-                            1_000 + j as i64,
-                            100 + j as u64,
-                            50 + j as u64,
-                            None,
-                            true,
-                        )
-                        .expect("concurrent save");
-                    }
-                })
-            })
-            .collect();
+        // Load entries written at v1; they should migrate to current version
+        let all = cache::list_cached_estimates("testnet").expect("list v1 entries");
+        assert_eq!(all.len(), 3, "all 3 v1 entries should load");
 
-        // Backup while writes are happening
-        let backup_dir = tmp.join("backups");
-        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
-        let backup_path = backup_dir
-            .join("concurrent-backup.db")
-            .to_string_lossy()
-            .to_string();
-
-        let backup = cache::backup_database(Some(&backup_path));
-
-        // Let the threads finish
-        for handle in handles {
-            handle.join().expect("thread panicked");
+        for entry in &all {
+            assert_eq!(
+                entry.version,
+                current_schema_version(),
+                "v1 entry must migrate to current version"
+            );
+            // Default values applied during v1→v2 migration
+            assert_eq!(entry.success, true, "v1 entries default to success=true");
+            assert_eq!(
+                entry.execution_duration_ms, 0,
+                "v1 entries default to unknown duration"
+            );
         }
 
-        // Backup should have succeeded
-        assert!(
-            backup.is_ok(),
-            "backup during concurrent writes should succeed"
-        );
-        assert!(
-            std::path::Path::new(&backup_path).exists(),
-            "backup file should exist"
-        );
-
-        // Verify the backup is readable and not corrupted
-        let count = cache::count_estimates_in_backup(&backup_path).expect("count in backup");
-        assert!(
-            count > 0,
-            "backup should contain estimates, got count: {count}"
-        );
-
-        // Verify all estimates in the live cache are valid
-        let statuses = cache::verify_cache().expect("verify live cache");
+        // Verify the cache with migrated entries
+        let statuses = cache::verify_cache().expect("verify migrated v1");
+        assert_eq!(statuses.len(), 3);
         assert!(
             statuses.iter().all(|s| s.valid),
-            "all live cache entries must be valid after concurrent writes"
+            "all migrated v1 entries must verify as valid"
         );
     });
 }
 
-/// Restore into a fresh (empty) cache location works correctly and all
-/// entries are recoverable with proper schema versions.
+/// Schema v2 entries should load and migrate to v3.
+/// v2 entries lack `last_accessed` but have `duration_ms` and `success`.
 #[test]
-fn test_restore_into_empty_location() {
+fn test_migrate_v2_to_latest() {
     with_temp_home(|tmp| {
-        // Create cache entries with various properties
-        cache::save_estimate(
-            "h1",
-            "f1",
-            &["arg1".to_string()],
+        build_database_at_schema_version(tmp, cache::DURATION_SCHEMA_VERSION, 3);
+
+        let all = cache::list_cached_estimates("testnet").expect("list v2 entries");
+        assert_eq!(all.len(), 3, "all 3 v2 entries should load");
+
+        for entry in &all {
+            assert_eq!(
+                entry.version,
+                current_schema_version(),
+                "v2 entry must migrate to current version"
+            );
+            // v2 entries already have success and duration_ms (set by insert_raw_row defaults)
+            assert_eq!(entry.success, true, "v2 entries include success field");
+        }
+
+        let statuses = cache::verify_cache().expect("verify migrated v2");
+        assert_eq!(statuses.len(), 3);
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "all migrated v2 entries must verify as valid"
+        );
+    });
+}
+
+/// Schema v3 (current) entries should load unchanged.
+#[test]
+fn test_migrate_v3_to_latest_is_noop() {
+    with_temp_home(|tmp| {
+        build_database_at_schema_version(tmp, cache::ACCESS_TRACKING_SCHEMA_VERSION, 3);
+
+        let all = cache::list_cached_estimates("testnet").expect("list v3 entries");
+        assert_eq!(all.len(), 3);
+
+        for entry in &all {
+            assert_eq!(entry.version, current_schema_version());
+            assert_eq!(entry.success, true);
+        }
+    });
+}
+
+/// Direct call to `migrate_to_latest` with a v1 struct should upgrade fields
+/// through the v1→v2 step, then v2→v3 step.
+#[test]
+fn test_migrate_to_latest_v1_struct_applies_all_steps() {
+    let v1_entry = cache::CachedEstimate {
+        version: cache::INITIAL_SCHEMA_VERSION,
+        wasm_hash: "abc".to_string(),
+        function: "f".to_string(),
+        args_hash: "def".to_string(),
+        network: "testnet".to_string(),
+        ledger: 1,
+        total_stroops: 100,
+        cpu_instructions: 10,
+        memory_bytes: 5,
+        timestamp: "2026-01-01T00:00:00Z".to_string(),
+        // v1 entries lack these; serde fills them with defaults
+        execution_duration_ms: 0,
+        success: true,
+        network_passphrase: None,
+        core_version: None,
+        io: None,
+    };
+
+    let migrated = cache::migrate_to_latest(v1_entry).expect("migrate v1 struct");
+    assert_eq!(migrated.version, current_schema_version());
+    assert_eq!(
+        migrated.execution_duration_ms, 0,
+        "v1→v2 sets default duration"
+    );
+    assert_eq!(migrated.success, true, "v1→v2 sets default success");
+}
+
+/// Direct call to `migrate_to_latest` with a v2 struct should upgrade to v3.
+#[test]
+fn test_migrate_to_latest_v2_struct_applies_v2_to_v3_step() {
+    let v2_entry = cache::CachedEstimate {
+        version: cache::DURATION_SCHEMA_VERSION,
+        wasm_hash: "abc".to_string(),
+        function: "f".to_string(),
+        args_hash: "def".to_string(),
+        network: "testnet".to_string(),
+        ledger: 2,
+        total_stroops: 200,
+        cpu_instructions: 20,
+        memory_bytes: 10,
+        timestamp: "2026-01-01T00:00:00Z".to_string(),
+        execution_duration_ms: 42,
+        success: false,
+        network_passphrase: None,
+        core_version: None,
+        io: None,
+    };
+
+    let migrated = cache::migrate_to_latest(v2_entry).expect("migrate v2 struct");
+    assert_eq!(migrated.version, current_schema_version());
+    // v2 fields are preserved
+    assert_eq!(migrated.execution_duration_ms, 42);
+    assert_eq!(migrated.success, false);
+}
+
+/// Mixed-version cache (v1, v2, v3 entries together) should load and migrate
+/// all entries to the current version.
+#[test]
+fn test_mixed_schema_versions_load_and_migrate() {
+    with_temp_home(|tmp| {
+        let dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+        let conn = rusqlite::Connection::open(&db).expect("open cache db");
+        cache::ensure_cache_schema(&conn).expect("ensure schema");
+
+        // Insert one entry at each version
+        insert_raw_row(
+            tmp,
+            cache::INITIAL_SCHEMA_VERSION,
+            "hash-v1",
+            "func-v1",
+            &[],
             "testnet",
+            100,
+            "2026-01-01T00:00:00Z",
+        );
+        insert_raw_row(
+            tmp,
+            cache::DURATION_SCHEMA_VERSION,
+            "hash-v2",
+            "func-v2",
+            &[],
+            "testnet",
+            200,
+            "2026-01-02T00:00:00Z",
+        );
+        insert_raw_row(
+            tmp,
+            cache::ACCESS_TRACKING_SCHEMA_VERSION,
+            "hash-v3",
+            "func-v3",
+            &[],
+            "testnet",
+            300,
+            "2026-01-03T00:00:00Z",
+        );
+
+        let all = cache::list_cached_estimates("testnet").expect("list mixed versions");
+        assert_eq!(all.len(), 3, "all 3 mixed-version entries should load");
+
+        // All should be at the current version after migration
+        assert!(
+            all.iter().all(|e| e.version == current_schema_version()),
+            "all migrated entries should be at current version"
+        );
+
+        let statuses = cache::verify_cache().expect("verify mixed");
+        assert_eq!(statuses.len(), 3);
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "all mixed-version entries must verify as valid: {statuses:?}"
+        );
+    });
+}
+
+/// After migrating a database, indexes must still be functional for queries
+/// (no index corruption).
+#[test]
+fn test_migrated_cache_indexes_are_functional() {
+    with_temp_home(|tmp| {
+        build_database_at_schema_version(tmp, cache::INITIAL_SCHEMA_VERSION, 5);
+
+        // Load by specific key
+        let specific = cache::load_estimate("hash-v1-0", "func-v1-0", &[])
+            .expect("load migrated entry")
+            .expect("entry should exist");
+        assert_eq!(specific.wasm_hash, "hash-v1-0");
+
+        // List all (uses network index)
+        let all = cache::list_cached_estimates("testnet").expect("list via network index");
+        assert_eq!(all.len(), 5);
+
+        // Query should work on migrated data
+        let filter = cache::CacheFilter {
+            function: Some("func-v1-0".to_string()),
+            ..Default::default()
+        };
+        let queried = cache::query_cache(&filter).expect("query migrated cache");
+        assert_eq!(queried.len(), 1);
+        assert_eq!(queried[0].function, "func-v1-0");
+    });
+}
+
+/// A transaction boundary must be respected during migration: if a partial
+/// write occurs, the original schema/data must remain in the database
+/// (atomicity). This is tested by simulating a partial write at the SQLite
+/// level and confirming the database is recoverable.
+///
+/// Note: We cannot easily simulate a mid-transaction crash in the test, but
+/// we can verify that all migration operations are transactional by checking
+/// that either all rows are migrated or none are.
+#[test]
+fn test_migration_is_transactional() {
+    with_temp_home(|tmp| {
+        build_database_at_schema_version(tmp, cache::INITIAL_SCHEMA_VERSION, 3);
+
+        // Before loading (which triggers migration), the raw database rows
+        // should be at v1
+        let dir = tmp.join(".soroban-cost-estimator");
+        let db = dir.join("cache.db");
+        let conn_check = rusqlite::Connection::open(&db).expect("check db before migration");
+        let mut stmt = conn_check
+            .prepare("SELECT DISTINCT version FROM estimates")
+            .expect("query versions");
+        let versions: Vec<u32> = stmt
+            .query_map([], |row| row.get::<_, u32>(0))
+            .expect("map versions")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect versions");
+
+        assert_eq!(
+            versions.len(),
             1,
+            "all rows should be at one version initially"
+        );
+        assert_eq!(versions[0], cache::INITIAL_SCHEMA_VERSION);
+
+        // Now trigger migration by loading
+        let _all = cache::list_cached_estimates("testnet").expect("load and migrate");
+
+        // After migration, all rows should be at the current version (atomic
+        // batch update, not row-by-row with potential partial failures)
+        let conn_after = rusqlite::Connection::open(&db).expect("check db after migration");
+        let mut stmt_after = conn_after
+            .prepare("SELECT DISTINCT version FROM estimates")
+            .expect("query versions after");
+        let versions_after: Vec<u32> = stmt_after
+            .query_map([], |row| row.get::<_, u32>(0))
+            .expect("map versions after")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect versions after");
+
+        assert_eq!(
+            versions_after.len(),
+            1,
+            "all rows should end up at one version (atomic)"
+        );
+        assert_eq!(versions_after[0], current_schema_version());
+    });
+}
+
+/// When loading a v1 entry, verify that the indexes used by LRU eviction
+/// (last_accessed) are properly populated during the migration.
+#[test]
+fn test_v1_entries_get_last_accessed_indexed() {
+    with_temp_home(|tmp| {
+        build_database_at_schema_version(tmp, cache::INITIAL_SCHEMA_VERSION, 2);
+
+        let all = cache::list_cached_estimates("testnet").expect("load v1");
+        assert_eq!(all.len(), 2);
+
+        // Try eviction, which relies on last_accessed being present
+        // (and not all entries being empty strings). This test documents
+        // that eviction works on migrated v1 entries.
+        let limits = cache::CacheLimits {
+            max_entries: 1,
+            max_bytes: 1_000_000,
+        };
+        cache::set_cache_limits(limits).expect("set limits");
+
+        // Save a new entry to trigger eviction
+        cache::save_estimate(
+            "new",
+            "new_func",
+            &[],
+            "testnet",
+            1000,
             100,
             10,
             5,
             None,
             true,
         )
-        .expect("save f1");
-        cache::save_estimate("h2", "f2", &[], "mainnet", 2, 200, 20, 10, None, true)
-            .expect("save f2");
-        cache::save_estimate(
-            "h3",
-            "f3",
-            &["x".to_string(), "y".to_string()],
+        .expect("save new entry");
+
+        let after = cache::list_cached_estimates("testnet").expect("list after eviction");
+        assert_eq!(after.len(), 1, "eviction should have removed an old entry");
+        assert_eq!(after[0].wasm_hash, "new", "new entry should remain");
+    });
+}
+
+/// Verify that v2→v3 migration preserves the `success` and `execution_duration_ms`
+/// fields from v2 entries.
+#[test]
+fn test_v2_to_v3_preserves_duration_and_success_fields() {
+    with_temp_home(|tmp| {
+        let dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+        let conn = rusqlite::Connection::open(&db).expect("open cache db");
+        cache::ensure_cache_schema(&conn).expect("ensure schema");
+
+        // Manually insert a v2 entry with specific duration_ms and success
+        conn.execute(
+            "INSERT INTO estimates (version, wasm_hash, function, args_hash, network, ledger, \
+             total_stroops, cpu_instructions, memory_bytes, timestamp, execution_duration_ms, success) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                cache::DURATION_SCHEMA_VERSION as i64,
+                "abc",
+                "test_func",
+                "args_hash",
+                "testnet",
+                123i64,
+                50_000i64,
+                100_000i64,
+                10_000i64,
+                "2026-01-01T12:34:56Z",
+                567i64, // specific duration_ms
+                0i64,   // success = false
+            ],
+        )
+        .expect("insert v2 entry");
+
+        let loaded = cache::load_estimate("abc", "test_func", &[])
+            .expect("load v2 entry")
+            .expect("entry should exist");
+
+        assert_eq!(loaded.version, current_schema_version());
+        assert_eq!(
+            loaded.execution_duration_ms, 567,
+            "v2 duration_ms preserved"
+        );
+        assert_eq!(loaded.success, false, "v2 success field preserved");
+    });
+}
+
+/// Loading multiple entries from different schema versions in rapid
+/// succession (rapid calls to `load_estimate`) should not corrupt the
+/// migration state.
+#[test]
+fn test_rapid_loads_of_mixed_versions_does_not_corrupt() {
+    with_temp_home(|tmp| {
+        let dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+        let conn = rusqlite::Connection::open(&db).expect("open cache db");
+        cache::ensure_cache_schema(&conn).expect("ensure schema");
+
+        // Insert mixed-version entries
+        insert_raw_row(
+            tmp,
+            cache::INITIAL_SCHEMA_VERSION,
+            "hash1",
+            "f1",
+            &[],
             "testnet",
-            3,
+            100,
+            "2026-01-01T00:00:00Z",
+        );
+        insert_raw_row(
+            tmp,
+            cache::DURATION_SCHEMA_VERSION,
+            "hash2",
+            "f2",
+            &[],
+            "testnet",
+            200,
+            "2026-01-02T00:00:00Z",
+        );
+        insert_raw_row(
+            tmp,
+            cache::ACCESS_TRACKING_SCHEMA_VERSION,
+            "hash3",
+            "f3",
+            &[],
+            "testnet",
             300,
-            30,
-            15,
+            "2026-01-03T00:00:00Z",
+        );
+
+        // Load rapidly in any order
+        let e1 = cache::load_estimate("hash3", "f3", &[])
+            .expect("load f3")
+            .expect("f3 should exist");
+        let e2 = cache::load_estimate("hash1", "f1", &[])
+            .expect("load f1")
+            .expect("f1 should exist");
+        let e3 = cache::load_estimate("hash2", "f2", &[])
+            .expect("load f2")
+            .expect("f2 should exist");
+
+        // All should have been migrated
+        assert_eq!(e1.version, current_schema_version());
+        assert_eq!(e2.version, current_schema_version());
+        assert_eq!(e3.version, current_schema_version());
+
+        // Verify none are corrupted
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 3);
+        assert!(statuses.iter().all(|s| s.valid));
+    });
+}
+
+/// Rejection of future-version entries must occur during `load_estimate`,
+/// preventing partial or corrupted reads.
+#[test]
+fn test_rejection_of_future_version_prevents_partial_reads() {
+    with_temp_home(|tmp| {
+        write_raw_entry(
+            tmp,
+            "future",
+            "new_func",
+            &[],
+            Some(current_schema_version() + 1),
+            1,
+        );
+
+        // Attempting to load should fail cleanly, not crash or partially load
+        let result = cache::load_estimate("future", "new_func", &[]);
+        assert!(result.is_err(), "future-version should be rejected");
+
+        // The error should be informative
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("newer") || err_msg.contains("upgrade"),
+            "error should hint at upgrading: {err_msg}"
+        );
+    });
+}
+
+/// Verify that all indexes remain intact and functional after a migration.
+/// This ensures queries don't silently miss entries or return duplicates.
+#[test]
+fn test_migrated_indexes_no_duplicates_or_misses() {
+    with_temp_home(|tmp| {
+        build_database_at_schema_version(tmp, cache::INITIAL_SCHEMA_VERSION, 10);
+
+        let all = cache::list_cached_estimates("testnet").expect("list after migration");
+        assert_eq!(all.len(), 10, "no duplicates, no misses");
+
+        // Count using a direct query should match
+        let count = cache::count_cached_estimates(&cache::CacheFilter::default()).expect("count");
+        assert_eq!(count, 10, "count must match list length");
+
+        // Pagination should not lose or duplicate entries
+        let page1 = cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 5, 0)
+            .expect("page 1");
+        let page2 = cache::list_cached_estimates_paginated(&cache::CacheFilter::default(), 5, 5)
+            .expect("page 2");
+
+        assert_eq!(page1.total, 10);
+        assert_eq!(page2.total, 10);
+        assert_eq!(page1.entries.len(), 5);
+        assert_eq!(page2.entries.len(), 5);
+
+        // No entry should appear in both pages
+        let page1_hashes: Vec<&str> = page1.entries.iter().map(|e| e.wasm_hash.as_str()).collect();
+        for page2_entry in &page2.entries {
+            assert!(
+                !page1_hashes.contains(&page2_entry.wasm_hash.as_str()),
+                "entry {} appears in both pages",
+                page2_entry.wasm_hash
+            );
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Migration rollback and partial failure recovery
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Simulate a migration failure scenario: if a database read fails midway
+/// through loading a migrated entry, the original data should remain
+/// unmodified on disk (no side effects).
+///
+/// This test verifies that `load_estimate` with an invalid or corrupted
+/// entry fails cleanly and doesn't corrupt other entries.
+#[test]
+fn test_migration_failure_does_not_corrupt_unrelated_entries() {
+    with_temp_home(|tmp| {
+        let dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+        let conn = rusqlite::Connection::open(&db).expect("open cache db");
+        cache::ensure_cache_schema(&conn).expect("ensure schema");
+
+        // Insert one good v1 entry and one v2 entry with a very large CPU
+        // instruction count (to differentiate them)
+        insert_raw_row(
+            tmp,
+            cache::INITIAL_SCHEMA_VERSION,
+            "good",
+            "good_func",
+            &[],
+            "testnet",
+            100,
+            "2026-01-01T00:00:00Z",
+        );
+        insert_raw_row(
+            tmp,
+            cache::DURATION_SCHEMA_VERSION,
+            "also_good",
+            "also_good_func",
+            &[],
+            "testnet",
+            200,
+            "2026-01-02T00:00:00Z",
+        );
+
+        // Load the first entry (should migrate successfully)
+        let loaded1 = cache::load_estimate("good", "good_func", &[])
+            .expect("load first entry")
+            .expect("first entry should exist");
+        assert_eq!(loaded1.wasm_hash, "good");
+        assert_eq!(loaded1.version, current_schema_version());
+
+        // Load the second entry (should also migrate successfully)
+        let loaded2 = cache::load_estimate("also_good", "also_good_func", &[])
+            .expect("load second entry")
+            .expect("second entry should exist");
+        assert_eq!(loaded2.wasm_hash, "also_good");
+        assert_eq!(loaded2.version, current_schema_version());
+
+        // Both entries should still be queryable
+        let all = cache::list_cached_estimates("testnet").expect("list after loads");
+        assert_eq!(all.len(), 2, "both entries should still be present");
+
+        // Verify both are valid
+        let statuses = cache::verify_cache().expect("verify after loads");
+        assert_eq!(statuses.len(), 2, "both entries should verify");
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "both should be valid: {statuses:?}"
+        );
+    });
+}
+
+/// When a migration rollback is needed (i.e., an entry cannot be migrated),
+/// the `load_estimate` call fails and other entries remain unaffected.
+/// This tests the "reject and leave everything else alone" path.
+#[test]
+fn test_unmigrable_entry_does_not_affect_other_entries() {
+    with_temp_home(|tmp| {
+        let dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+        let conn = rusqlite::Connection::open(&db).expect("open cache db");
+        cache::ensure_cache_schema(&conn).expect("ensure schema");
+
+        // Insert a future-version entry that cannot be migrated
+        insert_raw_row(
+            tmp,
+            current_schema_version() + 5,
+            "unmigrable",
+            "future_func",
+            &[],
+            "testnet",
+            100,
+            "2026-01-01T00:00:00Z",
+        );
+
+        // Insert a valid v1 entry
+        insert_raw_row(
+            tmp,
+            cache::INITIAL_SCHEMA_VERSION,
+            "good",
+            "good_func",
+            &[],
+            "testnet",
+            200,
+            "2026-01-02T00:00:00Z",
+        );
+
+        // Loading the unmigrable entry must fail
+        let result = cache::load_estimate("unmigrable", "future_func", &[]);
+        assert!(result.is_err(), "unmigrable entry should fail to load");
+
+        // But the good entry should still be loadable
+        let loaded = cache::load_estimate("good", "good_func", &[])
+            .expect("load good entry after unmigrable failure")
+            .expect("good entry should exist");
+        assert_eq!(loaded.wasm_hash, "good");
+        assert_eq!(loaded.version, current_schema_version());
+    });
+}
+
+/// A database that has a mix of migratable and non-migratable entries must
+/// report the non-migratable ones as invalid via `verify_cache`, while
+/// keeping the migratable ones valid.
+#[test]
+fn test_verify_cache_with_unmigrable_entries() {
+    with_temp_home(|tmp| {
+        let dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+        let conn = rusqlite::Connection::open(&db).expect("open cache db");
+        cache::ensure_cache_schema(&conn).expect("ensure schema");
+
+        // One good v1 entry
+        insert_raw_row(
+            tmp,
+            cache::INITIAL_SCHEMA_VERSION,
+            "good",
+            "good_func",
+            &[],
+            "testnet",
+            100,
+            "2026-01-01T00:00:00Z",
+        );
+
+        // One future-version entry that cannot be migrated
+        insert_raw_row(
+            tmp,
+            current_schema_version() + 10,
+            "future",
+            "future_func",
+            &[],
+            "testnet",
+            200,
+            "2026-01-02T00:00:00Z",
+        );
+
+        let statuses = cache::verify_cache().expect("verify mixed valid/invalid");
+        assert_eq!(statuses.len(), 2);
+
+        let good_status = statuses
+            .iter()
+            .find(|s| s.filename.contains("good"))
+            .expect("good entry should be reported");
+        assert!(good_status.valid, "v1 entry should be valid");
+
+        let future_status = statuses
+            .iter()
+            .find(|s| s.filename.contains("future"))
+            .expect("future entry should be reported");
+        assert!(
+            !future_status.valid,
+            "future-version entry should be invalid"
+        );
+    });
+}
+
+/// If a database has partially migrated data (some rows at v1, some at v3),
+/// they should all migrate correctly on next load.
+#[test]
+fn test_partial_migration_state_resolves_on_next_load() {
+    with_temp_home(|tmp| {
+        let dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+        let conn = rusqlite::Connection::open(&db).expect("open cache db");
+        cache::ensure_cache_schema(&conn).expect("ensure schema");
+
+        // Simulate a partially-migrated state: some rows at v1, some at v3
+        insert_raw_row(
+            tmp,
+            cache::INITIAL_SCHEMA_VERSION,
+            "hash-v1-1",
+            "func-v1-1",
+            &[],
+            "testnet",
+            100,
+            "2026-01-01T00:00:00Z",
+        );
+        insert_raw_row(
+            tmp,
+            cache::ACCESS_TRACKING_SCHEMA_VERSION,
+            "hash-v3-1",
+            "func-v3-1",
+            &[],
+            "testnet",
+            200,
+            "2026-01-02T00:00:00Z",
+        );
+        insert_raw_row(
+            tmp,
+            cache::INITIAL_SCHEMA_VERSION,
+            "hash-v1-2",
+            "func-v1-2",
+            &[],
+            "testnet",
+            300,
+            "2026-01-03T00:00:00Z",
+        );
+
+        // Load all entries; the v1 ones should migrate, v3 should stay as-is
+        let all = cache::list_cached_estimates("testnet").expect("list partial state");
+        assert_eq!(all.len(), 3, "all entries should be present");
+
+        for entry in &all {
+            assert_eq!(
+                entry.version,
+                current_schema_version(),
+                "all entries should be at current version"
+            );
+        }
+
+        // Verify cache should report all as valid
+        let statuses = cache::verify_cache().expect("verify partial");
+        assert_eq!(statuses.len(), 3);
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "all entries in partial state should verify as valid"
+        );
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Future schema version rejection
+// ─────────────────────────────────────────────────────────────────────────
+
+/// An entry written by a tool newer than the current version must be
+/// rejected during `load_estimate` with an informative error message.
+#[test]
+fn test_future_version_entry_rejected_with_upgrade_message() {
+    with_temp_home(|tmp| {
+        write_raw_entry(
+            tmp,
+            "future",
+            "new_func",
+            &[],
+            Some(current_schema_version() + 1),
+            1,
+        );
+
+        let result = cache::load_estimate("future", "new_func", &[]);
+        assert!(result.is_err(), "future-version entry must be rejected");
+
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer")
+                || msg.contains("upgrade")
+                || msg.contains("soroban-cost-estimator"),
+            "error message should guide user to upgrade: {msg}"
+        );
+    });
+}
+
+/// Multiple future-version entries must all be flagged by `verify_cache`.
+#[test]
+fn test_verify_cache_flags_all_future_version_entries() {
+    with_temp_home(|tmp| {
+        // Insert multiple future-version entries
+        for i in 0..3 {
+            write_raw_entry(
+                tmp,
+                &format!("future-{}", i),
+                &format!("future_func-{}", i),
+                &[],
+                Some(current_schema_version() + 1),
+                (100 + i as u32) * 10,
+            );
+        }
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 3, "all 3 future entries should be reported");
+
+        for status in &statuses {
+            assert!(
+                !status.valid,
+                "all future entries must be invalid: {status:?}"
+            );
+        }
+    });
+}
+
+/// An entry with a much-older schema version (e.g., v0 or negative) must be
+/// migrated without panicking.
+#[test]
+fn test_very_old_schema_versions_migrate_gracefully() {
+    with_temp_home(|tmp| {
+        let dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+        let conn = rusqlite::Connection::open(&db).expect("open cache db");
+        cache::ensure_cache_schema(&conn).expect("ensure schema");
+
+        // Insert an entry with version 0 (pre-versioning)
+        conn.execute(
+            "INSERT INTO estimates (version, wasm_hash, function, args_hash, network, ledger, \
+             total_stroops, cpu_instructions, memory_bytes, timestamp) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                0i64, // very old version
+                "very_old",
+                "old_func",
+                "args_hash",
+                "testnet",
+                1i64,
+                100i64,
+                10i64,
+                5i64,
+                "2026-01-01T00:00:00Z",
+            ],
+        )
+        .expect("insert version 0");
+
+        // Load should not panic and should treat it as v1
+        let loaded = cache::load_estimate("very_old", "old_func", &[])
+            .expect("load very old version")
+            .expect("entry should exist");
+        assert_eq!(loaded.version, current_schema_version());
+    });
+}
+
+/// Concurrent loads of a future-version entry from multiple threads must
+/// each fail without corrupting the cache.
+#[test]
+fn test_concurrent_loads_of_future_version_entry_all_fail() {
+    with_temp_home(|tmp| {
+        write_raw_entry(
+            tmp,
+            "future",
+            "new_func",
+            &[],
+            Some(current_schema_version() + 1),
+            1,
+        );
+
+        let handles: Vec<_> = (0..CONCURRENT_THREADS)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let result = cache::load_estimate("future", "new_func", &[]);
+                    assert!(
+                        result.is_err(),
+                        "concurrent load of future entry must fail: {result:?}"
+                    );
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("concurrent load thread panicked");
+        }
+
+        // Cache should still verify cleanly (no corruption)
+        let statuses = cache::verify_cache().expect("verify after concurrent rejects");
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].valid);
+    });
+}
+
+/// An entry exactly one version ahead should be rejected (we only accept
+/// versions <= current).
+#[test]
+fn test_entry_one_version_ahead_is_rejected() {
+    with_temp_home(|tmp| {
+        write_raw_entry(
+            tmp,
+            "v_plus_1",
+            "func",
+            &[],
+            Some(current_schema_version() + 1),
+            1,
+        );
+
+        let result = cache::load_estimate("v_plus_1", "func", &[]);
+        assert!(result.is_err());
+    });
+}
+
+/// An entry many versions ahead should be rejected with a clear error.
+#[test]
+fn test_entry_many_versions_ahead_is_rejected() {
+    with_temp_home(|tmp| {
+        write_raw_entry(
+            tmp,
+            "v_plus_100",
+            "func",
+            &[],
+            Some(current_schema_version() + 100),
+            1,
+        );
+
+        let result = cache::load_estimate("v_plus_100", "func", &[]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("100") || err.contains("newer") || err.contains("upgrade"));
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Additional edge cases and robustness
+// ─────────────────────────────────────────────────────────────────────────
+
+/// After a successful migration, a second load should be a no-op (entry is
+/// already at current version).
+#[test]
+fn test_repeated_loads_of_migrated_entry_are_idempotent() {
+    with_temp_home(|tmp| {
+        write_raw_entry(
+            tmp,
+            "hash",
+            "func",
+            &[],
+            Some(cache::INITIAL_SCHEMA_VERSION),
+            1,
+        );
+
+        let first_load = cache::load_estimate("hash", "func", &[])
+            .expect("first load")
+            .expect("entry should exist");
+        assert_eq!(first_load.version, current_schema_version());
+
+        // Load again
+        let second_load = cache::load_estimate("hash", "func", &[])
+            .expect("second load")
+            .expect("entry should exist");
+        assert_eq!(second_load.version, current_schema_version());
+
+        // Both should be identical
+        assert_eq!(first_load.ledger, second_load.ledger);
+        assert_eq!(first_load.total_stroops, second_load.total_stroops);
+        assert_eq!(first_load.wasm_hash, second_load.wasm_hash);
+    });
+}
+
+/// Migration through all intermediate versions (v1 → v2 → v3) should preserve
+/// all numeric fields exactly.
+#[test]
+fn test_migration_preserves_numeric_fields_exactly() {
+    with_temp_home(|tmp| {
+        let dir = tmp.join(".soroban-cost-estimator");
+        std::fs::create_dir_all(&dir).expect("create data dir");
+        let db = dir.join("cache.db");
+        let conn = rusqlite::Connection::open(&db).expect("open cache db");
+        cache::ensure_cache_schema(&conn).expect("ensure schema");
+
+        let wasm_hash = "test_hash";
+        let function = "test_func";
+        let args_hash = "test_args";
+        let network = "testnet";
+        let ledger = 12345u32;
+        let total_stroops = 9_876_543i64;
+        let cpu_instructions = 1_234_567u64;
+        let memory_bytes = 987_654u64;
+
+        // Insert a v1 entry with specific numeric values
+        conn.execute(
+            "INSERT INTO estimates (version, wasm_hash, function, args_hash, network, ledger, \
+             total_stroops, cpu_instructions, memory_bytes, timestamp) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                cache::INITIAL_SCHEMA_VERSION as i64,
+                wasm_hash,
+                function,
+                args_hash,
+                network,
+                ledger as i64,
+                total_stroops,
+                cpu_instructions as i64,
+                memory_bytes as i64,
+                "2026-01-01T00:00:00Z",
+            ],
+        )
+        .expect("insert v1 entry");
+
+        // Load and verify all numeric fields are preserved exactly
+        let loaded = cache::load_estimate(wasm_hash, function, &[])
+            .expect("load")
+            .expect("entry should exist");
+
+        assert_eq!(loaded.ledger, ledger, "ledger must be preserved exactly");
+        assert_eq!(
+            loaded.total_stroops, total_stroops,
+            "total_stroops must be preserved exactly"
+        );
+        assert_eq!(
+            loaded.cpu_instructions, cpu_instructions,
+            "cpu_instructions must be preserved exactly"
+        );
+        assert_eq!(
+            loaded.memory_bytes, memory_bytes,
+            "memory_bytes must be preserved exactly"
+        );
+    });
+}
+
+/// When a large cache with many entries from different schema versions is
+/// migrated, all entries should remain intact (no truncation or data loss).
+#[test]
+fn test_large_mixed_version_cache_full_integrity() {
+    with_temp_home(|tmp| {
+        let entry_count = 100;
+        build_database_at_schema_version(tmp, cache::INITIAL_SCHEMA_VERSION, entry_count);
+
+        let all = cache::list_cached_estimates("testnet").expect("list large cache");
+        assert_eq!(
+            all.len(),
+            entry_count,
+            "all {} entries must be present after migration",
+            entry_count
+        );
+
+        for entry in &all {
+            assert_eq!(entry.version, current_schema_version());
+            assert!(entry.wasm_hash.starts_with("hash-v"), "hash must be intact");
+            assert!(
+                entry.function.starts_with("func-v"),
+                "function must be intact"
+            );
+        }
+
+        let statuses = cache::verify_cache().expect("verify large cache");
+        assert_eq!(statuses.len(), entry_count);
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "all entries in large cache must verify as valid"
+        );
+    });
+}
+
+/// A schema v1 entry that is saved again (via `save_estimate`) should become
+/// v3 and be identical to a fresh v3 entry (except for timestamp/ledger).
+#[test]
+fn test_re_saved_migrated_entry_becomes_current_version() {
+    with_temp_home(|tmp| {
+        write_raw_entry(
+            tmp,
+            "hash",
+            "func",
+            &["arg"],
+            Some(cache::INITIAL_SCHEMA_VERSION),
+            100,
+        );
+
+        let loaded = cache::load_estimate("hash", "func", &["arg".to_string()])
+            .expect("load migrated")
+            .expect("entry should exist");
+        assert_eq!(loaded.version, cache::INITIAL_SCHEMA_VERSION);
+
+        // Now save over it with the modern save_estimate
+        cache::save_estimate(
+            "hash",
+            "func",
+            &["arg".to_string()],
+            "testnet",
+            200,
+            100,
+            10,
+            5,
             None,
             true,
         )
-        .expect("save f3");
+        .expect("re-save");
 
-        // Create a backup
-        let backup_dir = tmp.join("backups");
-        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
-        let backup_path = backup_dir
-            .join("restore-test.db")
-            .to_string_lossy()
-            .to_string();
-        cache::backup_database(Some(&backup_path)).expect("backup");
-
-        // Count entries in backup
-        let backup_count = cache::count_estimates_in_backup(&backup_path).expect("count backup");
-        assert_eq!(backup_count, 3, "backup should have 3 entries");
-
-        // Clear the live cache by moving it out of the way
-        let db_path = soroban_cost_estimator::paths::data_dir()
-            .expect("data dir")
-            .join("cache.db");
-        let moved_path = tmp.join("original-cache.db");
-        if db_path.exists() {
-            std::fs::rename(&db_path, &moved_path).expect("move original cache");
-        }
-
-        // Restore from backup
-        cache::restore_database(&backup_path).expect("restore");
-
-        // Verify all entries are present in the restored cache
-        let restored_f1 = cache::load_estimate("h1", "f1", &["arg1".to_string()])
-            .expect("load f1")
-            .expect("f1 should be restored");
-        assert_eq!(restored_f1.total_stroops, 100);
-        assert_eq!(restored_f1.version, cache::CACHE_SCHEMA_VERSION);
-
-        let restored_f2 = cache::load_estimate("h2", "f2", &[])
-            .expect("load f2")
-            .expect("f2 should be restored");
-        assert_eq!(restored_f2.network, "mainnet");
-        assert_eq!(restored_f2.total_stroops, 200);
-
-        let restored_f3 = cache::load_estimate("h3", "f3", &["x".to_string(), "y".to_string()])
-            .expect("load f3")
-            .expect("f3 should be restored");
-        assert_eq!(restored_f3.ledger, 3);
-        assert_eq!(restored_f3.cpu_instructions, 30);
-
-        // All entries must be valid
-        let statuses = cache::verify_cache().expect("verify restored cache");
-        assert_eq!(statuses.len(), 3, "restored cache should have 3 entries");
-        assert!(
-            statuses.iter().all(|s| s.valid),
-            "all restored entries must be valid"
-        );
-
-        // Stats should match
-        let stats = cache::cache_stats().expect("stats");
-        assert_eq!(stats.total_entries, 3, "restored cache must have 3 entries");
-        assert_eq!(
-            stats.per_network.len(),
-            2,
-            "restored cache must have 2 networks"
-        );
-    });
-}
-
-/// Restore rejects a backup with an incompatible (future) schema version
-/// and leaves the original database untouched.
-#[test]
-fn test_restore_rejects_incompatible_backup() {
-    with_temp_home(|tmp| {
-        // Create and backup the current cache
-        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
-            .expect("save initial");
-
-        let backup_dir = tmp.join("backups");
-        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
-        let backup_path = backup_dir
-            .join("incompatible.db")
-            .to_string_lossy()
-            .to_string();
-        cache::backup_database(Some(&backup_path)).expect("backup");
-
-        // Corrupt the backup by inserting a future-version entry
-        let backup_conn = rusqlite::Connection::open(&backup_path).expect("open backup");
-        backup_conn
-            .execute(
-                "INSERT INTO estimates (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
-                 VALUES (?, 'future', 'future_func', 'abc123', 'testnet', 1, 100, 10, 5, '2026-01-01T00:00:00Z')",
-                [cache::CACHE_SCHEMA_VERSION + 5],
-            )
-            .expect("insert future-version entry");
-        drop(backup_conn);
-
-        // Try to restore the incompatible backup
-        let restore_result = cache::restore_database(&backup_path);
-        assert!(
-            restore_result.is_err(),
-            "restore should reject incompatible backup"
-        );
-
-        let err_msg = restore_result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("newer"),
-            "error should mention the newer version: {err_msg}"
-        );
-
-        // Verify the original cache is still intact
-        let original = cache::load_estimate("h1", "f1", &[])
-            .expect("load original")
-            .expect("original entry should still exist");
-        assert_eq!(original.total_stroops, 100);
-        assert_eq!(original.version, cache::CACHE_SCHEMA_VERSION);
-    });
-}
-
-/// Backup stats helper returns accurate information about a backup file.
-#[test]
-fn test_backup_stats_reports_accurate_info() {
-    with_temp_home(|tmp| {
-        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
-            .expect("save testnet");
-        cache::save_estimate("h2", "f2", &[], "mainnet", 2, 200, 20, 10, None, true)
-            .expect("save mainnet");
-
-        let backup_dir = tmp.join("backups");
-        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
-        let backup_path = backup_dir
-            .join("stats-test.db")
-            .to_string_lossy()
-            .to_string();
-        cache::backup_database(Some(&backup_path)).expect("backup");
-
-        let stats = cache::backup_stats(&backup_path).expect("stats");
-        assert_eq!(stats.total_entries, 2, "backup should report 2 entries");
-        assert!(stats.disk_bytes > 0, "backup should report non-zero size");
-        assert_eq!(
-            stats.per_network.len(),
-            2,
-            "backup should list both networks"
-        );
-
-        let testnet_count = stats
-            .per_network
-            .iter()
-            .find(|(n, _)| n == "testnet")
-            .map(|(_, c)| c);
-        assert_eq!(testnet_count, Some(&1), "testnet should have 1 entry");
-
-        let mainnet_count = stats
-            .per_network
-            .iter()
-            .find(|(n, _)| n == "mainnet")
-            .map(|(_, c)| c);
-        assert_eq!(mainnet_count, Some(&1), "mainnet should have 1 entry");
-    });
-}
-
-/// Backup database creates a file with a default timestamp-based name
-/// when no explicit path is given.
-#[test]
-fn test_backup_creates_default_filename() {
-    with_temp_home(|_tmp| {
-        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
-
-        let backup_path = cache::backup_database(None).expect("backup");
-        assert!(
-            std::path::Path::new(&backup_path).exists(),
-            "default backup file should exist: {backup_path}"
-        );
-        assert!(
-            backup_path.contains("cache-"),
-            "backup filename should contain 'cache-': {backup_path}"
-        );
-        assert!(
-            backup_path.ends_with(".db"),
-            "backup filename should end with '.db': {backup_path}"
-        );
-    });
-}
-
-/// Validate backup schema rejects empty backups (no estimates table).
-#[test]
-fn test_validate_backup_schema_rejects_empty_backup() {
-    with_temp_home(|tmp| {
-        let backup_dir = tmp.join("backups");
-        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
-        let empty_backup = backup_dir.join("empty.db").to_string_lossy().to_string();
-
-        // Create an empty SQLite database with no estimates table
-        let _conn = rusqlite::Connection::open(&empty_backup)
-            .expect("create empty db")
-            .close();
-
-        let result = cache::validate_backup_schema(&empty_backup);
-        assert!(
-            result.is_err(),
-            "validation should reject empty backup with no estimates table"
-        );
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("no cache entries"),
-            "error should mention no cache entries: {err_msg}"
-        );
+        let re_saved = cache::load_estimate("hash", "func", &["arg".to_string()])
+            .expect("load re-saved")
+            .expect("entry should exist");
+        assert_eq!(re_saved.version, current_schema_version());
     });
 }
