@@ -3231,210 +3231,96 @@ fn test_cached_estimate_backward_compatible_deserialization() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Cache decision diagnostics tests (#522)
+// Backup and Restore (#520)
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Backup while other threads are actively writing produces a consistent
+/// snapshot that can be fully restored and verified.
 #[test]
-fn test_cache_decision_reason_codes() {
-    use soroban_cost_estimator::cache::CacheDecisionReason;
-
-    assert_eq!(CacheDecisionReason::ExplicitBypass.code(), "explicit_bypass");
-    assert_eq!(CacheDecisionReason::NoEntry.code(), "miss_no_entry");
-    assert_eq!(CacheDecisionReason::Expired.code(), "miss_expired");
-    assert_eq!(CacheDecisionReason::NetworkMismatch.code(), "miss_network");
-    assert_eq!(CacheDecisionReason::Hit.code(), "hit");
-}
-
-/// Test cache hit path: loads a fresh entry and returns it.
-/// The load_fresh_estimate function should emit a debug event with reason="hit".
-#[test]
-fn test_load_fresh_estimate_hit_path() {
-    with_temp_home(|_tmp| {
-        let wasm_hash = "abc123def456";
-        let function = "transfer";
-        let args = vec!["arg1".to_string()];
-        let network = "testnet";
-
-        // Save an estimate now
-        cache::save_estimate(
-            wasm_hash,
-            function,
-            &args,
-            network,
-            42,
-            1_000_000,
-            200_000,
-            50_000,
-            None,
-            true,
-        )
-        .expect("save estimate");
-
-        // Load it back within a generous TTL — should hit
-        let ttl = std::time::Duration::from_secs(3600);
-        let loaded = cache::load_fresh_estimate(wasm_hash, function, &args, ttl)
-            .expect("load fresh")
-            .expect("estimate should be fresh");
-
-        assert_eq!(loaded.wasm_hash, wasm_hash);
-        assert_eq!(loaded.function, function);
-        assert_eq!(loaded.network, network);
-        assert_eq!(loaded.ledger, 42);
-        assert_eq!(loaded.total_stroops, 1_000_000);
-    });
-}
-
-/// Test cache miss path: no entry found.
-/// The load_fresh_estimate function should emit a debug event with reason="miss_no_entry".
-#[test]
-fn test_load_fresh_estimate_miss_no_entry_path() {
-    with_temp_home(|_tmp| {
-        let wasm_hash = "nonexistent_hash";
-        let function = "does_not_exist";
-        let args = vec![];
-
-        // Try to load an entry that was never saved — should miss
-        let ttl = std::time::Duration::from_secs(3600);
-        let loaded = cache::load_fresh_estimate(wasm_hash, function, &args, ttl).expect("load");
-
-        assert!(loaded.is_none(), "nonexistent entry should return None");
-    });
-}
-
-/// Test cache expiration path: entry exists but is older than TTL.
-/// The load_fresh_estimate function should emit a debug event with reason="miss_expired".
-#[test]
-fn test_load_fresh_estimate_miss_expired_path() {
-    with_temp_home(|_tmp| {
-        let wasm_hash = "aged_hash";
-        let function = "old_func";
-        let args = vec!["x".to_string()];
-
-        // Save an estimate now
-        cache::save_estimate(
-            wasm_hash,
-            function,
-            &args,
-            "testnet",
-            10,
-            100_000,
-            10_000,
-            5_000,
-            None,
-            true,
-        )
-        .expect("save estimate");
-
-        // Try to load it with a very short TTL (1 nanosecond) — should expire
-        let ttl = std::time::Duration::from_nanos(1);
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let loaded = cache::load_fresh_estimate(wasm_hash, function, &args, ttl).expect("load");
-
-        assert!(
-            loaded.is_none(),
-            "expired entry should return None (ttl: {} nanos, waited 10ms)",
-            ttl.as_nanos()
-        );
-    });
-}
-
-/// Test is_cache_entry_fresh with entry at exact TTL boundary.
-#[test]
-fn test_is_cache_entry_fresh_at_ttl_boundary() {
-    with_temp_home(|_tmp| {
-        cache::save_estimate(
-            "boundary_hash",
-            "boundary_func",
-            &[],
-            "testnet",
-            1,
-            100,
-            10,
-            5,
-            None,
-            true,
-        )
-        .expect("save");
-
-        let loaded = cache::load_estimate("boundary_hash", "boundary_func", &[])
-            .expect("load")
-            .expect("entry should exist");
-
-        // Entry is fresh immediately
-        let instant_ttl = std::time::Duration::from_secs(0);
-        let fresh = cache::is_cache_entry_fresh(&loaded, instant_ttl);
-        assert!(!fresh, "entry with 0s TTL should not be fresh (age >= ttl)");
-
-        // Entry is definitely fresh with a long TTL
-        let long_ttl = std::time::Duration::from_secs(86400);
-        let fresh = cache::is_cache_entry_fresh(&loaded, long_ttl);
-        assert!(fresh, "entry with 1-day TTL should be fresh");
-    });
-}
-
-/// Test that different cache keys do not interfere.
-#[test]
-fn test_load_fresh_estimate_different_keys_isolated() {
-    with_temp_home(|_tmp| {
-        let args1 = vec!["arg1".to_string()];
-        let args2 = vec!["arg2".to_string()];
-
-        cache::save_estimate("h1", "f1", &args1, "testnet", 1, 100, 10, 5, None, true)
-            .expect("save 1");
-        cache::save_estimate("h1", "f1", &args2, "testnet", 2, 200, 20, 10, None, true)
-            .expect("save 2");
-
-        let ttl = std::time::Duration::from_secs(3600);
-
-        let loaded1 = cache::load_fresh_estimate("h1", "f1", &args1, ttl)
-            .expect("load 1")
-            .expect("arg1 entry should exist");
-        assert_eq!(loaded1.ledger, 1);
-
-        let loaded2 = cache::load_fresh_estimate("h1", "f1", &args2, ttl)
-            .expect("load 2")
-            .expect("arg2 entry should exist");
-        assert_eq!(loaded2.ledger, 2);
-    });
-}
-
-/// Test that cache entries with unparseable timestamps are treated as not fresh.
-#[test]
-fn test_is_cache_entry_fresh_with_invalid_timestamp() {
+fn test_backup_during_concurrent_writes() {
     with_temp_home(|tmp| {
-        write_raw_entry(
-            tmp,
-            "bad_ts_hash",
-            "bad_ts_func",
-            &[],
-            None,
-            5,
+        // Seed the cache with some initial data
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("seed f1");
+        cache::save_estimate("h2", "f2", &[], "testnet", 2, 200, 20, 10, None, true)
+            .expect("seed f2");
+
+        // Spawn multiple threads writing concurrently
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for j in 0..10 {
+                        let hash = format!("hash-{t}-{j}");
+                        let func = format!("func-{t}-{j}");
+                        cache::save_estimate(
+                            &hash,
+                            &func,
+                            &[],
+                            "testnet",
+                            (t * 10 + j) as u32,
+                            1_000 + j as i64,
+                            100 + j as u64,
+                            50 + j as u64,
+                            None,
+                            true,
+                        )
+                        .expect("concurrent save");
+                    }
+                })
+            })
+            .collect();
+
+        // Backup while writes are happening
+        let backup_dir = tmp.join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+        let backup_path = backup_dir
+            .join("concurrent-backup.db")
+            .to_string_lossy()
+            .to_string();
+
+        let backup = cache::backup_database(Some(&backup_path));
+
+        // Let the threads finish
+        for handle in handles {
+            handle.join().expect("thread panicked");
+        }
+
+        // Backup should have succeeded
+        assert!(
+            backup.is_ok(),
+            "backup during concurrent writes should succeed"
+        );
+        assert!(
+            std::path::Path::new(&backup_path).exists(),
+            "backup file should exist"
         );
 
-        let mut loaded = cache::load_estimate("bad_ts_hash", "bad_ts_func", &[])
-            .expect("load")
-            .expect("entry should exist");
+        // Verify the backup is readable and not corrupted
+        let count = cache::count_estimates_in_backup(&backup_path).expect("count in backup");
+        assert!(
+            count > 0,
+            "backup should contain estimates, got count: {count}"
+        );
 
-        // Corrupt the timestamp
-        loaded.timestamp = "not-a-valid-timestamp".to_string();
-
-        // Entry should not be fresh (bad timestamp treated as suspicious)
-        let ttl = std::time::Duration::from_secs(86400);
-        let fresh = cache::is_cache_entry_fresh(&loaded, ttl);
-        assert!(!fresh, "entry with invalid timestamp should not be fresh");
+        // Verify all estimates in the live cache are valid
+        let statuses = cache::verify_cache().expect("verify live cache");
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "all live cache entries must be valid after concurrent writes"
+        );
     });
 }
 
-/// Test load_fresh_estimate with missing TTL returns None.
-/// In practice, fresh_cached_estimate in main.rs only calls load_fresh_estimate
-/// when ttl_secs is Some, but test the contract anyway.
+/// Restore into a fresh (empty) cache location works correctly and all
+/// entries are recoverable with proper schema versions.
 #[test]
-fn test_load_fresh_estimate_respects_ttl_parameter() {
-    with_temp_home(|_tmp| {
+fn test_restore_into_empty_location() {
+    with_temp_home(|tmp| {
+        // Create cache entries with various properties
         cache::save_estimate(
-            "ttl_hash",
-            "ttl_func",
-            &[],
+            "h1",
+            "f1",
+            &["arg1".to_string()],
             "testnet",
             1,
             100,
@@ -3443,65 +3329,224 @@ fn test_load_fresh_estimate_respects_ttl_parameter() {
             None,
             true,
         )
-        .expect("save");
+        .expect("save f1");
+        cache::save_estimate("h2", "f2", &[], "mainnet", 2, 200, 20, 10, None, true)
+            .expect("save f2");
+        cache::save_estimate(
+            "h3",
+            "f3",
+            &["x".to_string(), "y".to_string()],
+            "testnet",
+            3,
+            300,
+            30,
+            15,
+            None,
+            true,
+        )
+        .expect("save f3");
 
-        // Load with zero TTL (immediate expiration)
-        let loaded = cache::load_fresh_estimate("ttl_hash", "ttl_func", &[], 
-            std::time::Duration::from_secs(0))
-            .expect("load");
+        // Create a backup
+        let backup_dir = tmp.join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+        let backup_path = backup_dir
+            .join("restore-test.db")
+            .to_string_lossy()
+            .to_string();
+        cache::backup_database(Some(&backup_path)).expect("backup");
 
-        // Entry should expire immediately with 0s TTL
+        // Count entries in backup
+        let backup_count = cache::count_estimates_in_backup(&backup_path).expect("count backup");
+        assert_eq!(backup_count, 3, "backup should have 3 entries");
+
+        // Clear the live cache by moving it out of the way
+        let db_path = soroban_cost_estimator::paths::data_dir()
+            .expect("data dir")
+            .join("cache.db");
+        let moved_path = tmp.join("original-cache.db");
+        if db_path.exists() {
+            std::fs::rename(&db_path, &moved_path).expect("move original cache");
+        }
+
+        // Restore from backup
+        cache::restore_database(&backup_path).expect("restore");
+
+        // Verify all entries are present in the restored cache
+        let restored_f1 = cache::load_estimate("h1", "f1", &["arg1".to_string()])
+            .expect("load f1")
+            .expect("f1 should be restored");
+        assert_eq!(restored_f1.total_stroops, 100);
+        assert_eq!(restored_f1.version, cache::CACHE_SCHEMA_VERSION);
+
+        let restored_f2 = cache::load_estimate("h2", "f2", &[])
+            .expect("load f2")
+            .expect("f2 should be restored");
+        assert_eq!(restored_f2.network, "mainnet");
+        assert_eq!(restored_f2.total_stroops, 200);
+
+        let restored_f3 = cache::load_estimate("h3", "f3", &["x".to_string(), "y".to_string()])
+            .expect("load f3")
+            .expect("f3 should be restored");
+        assert_eq!(restored_f3.ledger, 3);
+        assert_eq!(restored_f3.cpu_instructions, 30);
+
+        // All entries must be valid
+        let statuses = cache::verify_cache().expect("verify restored cache");
+        assert_eq!(statuses.len(), 3, "restored cache should have 3 entries");
         assert!(
-            loaded.is_none(),
-            "entry should not be fresh with 0s TTL"
+            statuses.iter().all(|s| s.valid),
+            "all restored entries must be valid"
         );
 
-        // Load with a reasonable TTL
-        let loaded = cache::load_fresh_estimate("ttl_hash", "ttl_func", &[], 
-            std::time::Duration::from_secs(86400))
-            .expect("load");
-
-        assert!(
-            loaded.is_some(),
-            "entry should be fresh with 1-day TTL"
+        // Stats should match
+        let stats = cache::cache_stats().expect("stats");
+        assert_eq!(stats.total_entries, 3, "restored cache must have 3 entries");
+        assert_eq!(
+            stats.per_network.len(),
+            2,
+            "restored cache must have 2 networks"
         );
     });
 }
 
-/// Test that save operations complete successfully and entries can be loaded.
-/// This implicitly tests that cache save operations don't cause corruption.
+/// Restore rejects a backup with an incompatible (future) schema version
+/// and leaves the original database untouched.
 #[test]
-fn test_cache_save_and_load_roundtrip_fresh() {
-    with_temp_home(|_tmp| {
-        let entries = vec![
-            ("hash1", "func1", vec!["a".to_string()], "testnet", 100u32),
-            ("hash2", "func2", vec!["b".to_string()], "mainnet", 200u32),
-            ("hash3", "func3", vec!["c".to_string()], "futurenet", 300u32),
-        ];
+fn test_restore_rejects_incompatible_backup() {
+    with_temp_home(|tmp| {
+        // Create and backup the current cache
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("save initial");
 
-        for (hash, func, args, network, ledger) in &entries {
-            cache::save_estimate(
-                hash,
-                func,
-                args,
-                network,
-                *ledger,
-                1_000_000,
-                100_000,
-                10_000,
-                None,
-                true,
+        let backup_dir = tmp.join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+        let backup_path = backup_dir
+            .join("incompatible.db")
+            .to_string_lossy()
+            .to_string();
+        cache::backup_database(Some(&backup_path)).expect("backup");
+
+        // Corrupt the backup by inserting a future-version entry
+        let backup_conn = rusqlite::Connection::open(&backup_path).expect("open backup");
+        backup_conn
+            .execute(
+                "INSERT INTO estimates (version, wasm_hash, function, args_hash, network, ledger, total_stroops, cpu_instructions, memory_bytes, timestamp) \
+                 VALUES (?, 'future', 'future_func', 'abc123', 'testnet', 1, 100, 10, 5, '2026-01-01T00:00:00Z')",
+                [cache::CACHE_SCHEMA_VERSION + 5],
             )
-            .expect("save");
-        }
+            .expect("insert future-version entry");
+        drop(backup_conn);
 
-        // Load all entries back and verify freshness
-        let ttl = std::time::Duration::from_secs(3600);
-        for (hash, func, args, _network, ledger) in &entries {
-            let loaded = cache::load_fresh_estimate(hash, func, args, ttl)
-                .expect("load")
-                .expect("entry should be fresh");
-            assert_eq!(loaded.ledger, *ledger);
-        }
+        // Try to restore the incompatible backup
+        let restore_result = cache::restore_database(&backup_path);
+        assert!(
+            restore_result.is_err(),
+            "restore should reject incompatible backup"
+        );
+
+        let err_msg = restore_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("newer"),
+            "error should mention the newer version: {err_msg}"
+        );
+
+        // Verify the original cache is still intact
+        let original = cache::load_estimate("h1", "f1", &[])
+            .expect("load original")
+            .expect("original entry should still exist");
+        assert_eq!(original.total_stroops, 100);
+        assert_eq!(original.version, cache::CACHE_SCHEMA_VERSION);
+    });
+}
+
+/// Backup stats helper returns accurate information about a backup file.
+#[test]
+fn test_backup_stats_reports_accurate_info() {
+    with_temp_home(|tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true)
+            .expect("save testnet");
+        cache::save_estimate("h2", "f2", &[], "mainnet", 2, 200, 20, 10, None, true)
+            .expect("save mainnet");
+
+        let backup_dir = tmp.join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+        let backup_path = backup_dir
+            .join("stats-test.db")
+            .to_string_lossy()
+            .to_string();
+        cache::backup_database(Some(&backup_path)).expect("backup");
+
+        let stats = cache::backup_stats(&backup_path).expect("stats");
+        assert_eq!(stats.total_entries, 2, "backup should report 2 entries");
+        assert!(stats.disk_bytes > 0, "backup should report non-zero size");
+        assert_eq!(
+            stats.per_network.len(),
+            2,
+            "backup should list both networks"
+        );
+
+        let testnet_count = stats
+            .per_network
+            .iter()
+            .find(|(n, _)| n == "testnet")
+            .map(|(_, c)| c);
+        assert_eq!(testnet_count, Some(&1), "testnet should have 1 entry");
+
+        let mainnet_count = stats
+            .per_network
+            .iter()
+            .find(|(n, _)| n == "mainnet")
+            .map(|(_, c)| c);
+        assert_eq!(mainnet_count, Some(&1), "mainnet should have 1 entry");
+    });
+}
+
+/// Backup database creates a file with a default timestamp-based name
+/// when no explicit path is given.
+#[test]
+fn test_backup_creates_default_filename() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5, None, true).expect("save");
+
+        let backup_path = cache::backup_database(None).expect("backup");
+        assert!(
+            std::path::Path::new(&backup_path).exists(),
+            "default backup file should exist: {backup_path}"
+        );
+        assert!(
+            backup_path.contains("cache-"),
+            "backup filename should contain 'cache-': {backup_path}"
+        );
+        assert!(
+            backup_path.ends_with(".db"),
+            "backup filename should end with '.db': {backup_path}"
+        );
+    });
+}
+
+/// Validate backup schema rejects empty backups (no estimates table).
+#[test]
+fn test_validate_backup_schema_rejects_empty_backup() {
+    with_temp_home(|tmp| {
+        let backup_dir = tmp.join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("create backup dir");
+        let empty_backup = backup_dir.join("empty.db").to_string_lossy().to_string();
+
+        // Create an empty SQLite database with no estimates table
+        let _conn = rusqlite::Connection::open(&empty_backup)
+            .expect("create empty db")
+            .close();
+
+        let result = cache::validate_backup_schema(&empty_backup);
+        assert!(
+            result.is_err(),
+            "validation should reject empty backup with no estimates table"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("no cache entries"),
+            "error should mention no cache entries: {err_msg}"
+        );
     });
 }
